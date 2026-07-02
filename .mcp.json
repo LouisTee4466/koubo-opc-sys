@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "airtable": {
+      "type": "http",
+      "url": "https://mcp.airtable.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${AIRTABLE_PAT}"
+      },
+      "allowedEnvVars": ["AIRTABLE_PAT"]
+    }
+  }
+}
