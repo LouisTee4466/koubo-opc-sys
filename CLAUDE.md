@@ -407,13 +407,14 @@ cp .env.template .env
 
 ---
 
-### ⚙️ 第 5 步：安装 Modal
+### ⚙️ 第 5 步：安装依赖 + Modal
 
 ```bash
-pip install modal
+pip install -r requirements.txt
 modal setup
 ```
 
+第一条装齐全部本地依赖（modal / fastapi / anthropic / requests 等，部署和注册 webhook 都要用）。
 `modal setup` 会打开浏览器让你登录 Modal 账号（没有就注册一个，免费额度够用）。
 
 ---
