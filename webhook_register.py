@@ -112,10 +112,10 @@ def setup():
     _write_env("AIRTABLE_WEBHOOK_SECRET", webhook_secret)
     _sync_modal_secret()
 
-    print(f"✅ Webhook 注册成功")
+    print("✅ Webhook 注册成功")
     print(f"   ID：{webhook_id}")
     print(f"   到期：{expiry}")
-    print(f"   .env + Modal Secret 均已更新")
+    print("   .env + Modal Secret 均已更新")
 
 
 def refresh():

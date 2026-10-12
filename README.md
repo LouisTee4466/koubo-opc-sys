@@ -43,7 +43,7 @@ flowchart TD
     D --> G3{{"👤 确认出片<br/>Heygen Status → ready"}}
     G3 --> E["🎬 HeyGen 数字人出片"]
     E --> G4{{"👤 看片<br/>Heygen Status → approved"}}
-    G4 -- "不满意：改稿后改回 ready" --> E
+    G4 -- "不满意：改回 ready（可改稿）" --> E
     G4 --> F["🚀 定时发布<br/>Instagram Reel + Facebook Reel"]
     F --> H["📊 24h / 72h 数据回收"]
     H --> I["🧠 每周一复盘"]
@@ -59,7 +59,7 @@ flowchart TD
 
 ## 🏗 系统架构
 
-**Airtable 是唯一的状态存储和审核台，Modal 是无状态执行器。**
+**Airtable 是唯一的状态存储和审核台；Modal 只存 webhook 游标 / 当月花费 / 去重锁这几项簿记，所有业务状态都在 Airtable。**
 
 ```mermaid
 flowchart TB
@@ -72,12 +72,12 @@ flowchart TB
         VS["Video Stats<br/>播放 / 赞 / 评 / 转"]
     end
 
-    subgraph MD["⚡ Modal · 无状态执行器"]
+    subgraph MD["⚡ Modal · 执行器（业务状态都在 Airtable）"]
         direction LR
         WH["webhook_handler<br/>收变更通知"] --> DP["dispatch_change<br/>状态分发"]
         DP --> HD["阶段处理函数<br/>选题 · 写稿 · Caption · 出片"]
         CR["cron<br/>每天 / 每周一 17:00 UTC"] --> HD
-        ST[("Modal Dict<br/>webhook 游标 · 当月花费")]
+        ST[("Modal Dict<br/>webhook 游标 · 当月花费 · 去重锁")]
     end
 
     subgraph EX["🌐 外部服务"]
@@ -173,7 +173,7 @@ sequenceDiagram
 | 1 | 等待选题 | 从 10 条里选 1 条，填进 `Final Topic` | `Topic Status` → `done` |
 | 2 | 等待文案审核 | 选钩子 + 正文 + CTA，拼好填进 `Final Script` | `Review Status` → `approved` |
 | 3 | 等待视频生成 | 确认各平台 Caption | `Heygen Status` → `ready` |
-| 4 | 等待视频审核 | 看片。满意就放行；不满意改稿后改回 `ready` | `Heygen Status` → `approved` |
+| 4 | 等待视频审核 | 看片。满意就放行；不满意改稿后改回 `ready`（不改稿也会重新出片） | `Heygen Status` → `approved` |
 
 > 💡 `Scheduled Publish Time` 留空 = 下一次每日定时任务发布；填了日期 = 到那天发布。<br/>
 > ⚠️ 重新出片会再收一次 HeyGen 渲染费，文字问题尽量在第 2 步改掉。
@@ -258,7 +258,7 @@ koubo-opc-sys/
 
 | 时间（UTC） | 任务 |
 |---|---|
-| 每天 17:00 | 新建当天流水线（情报 + 选题）→ 发布到期视频 → 回收 24h / 72h 数据 → webhook 续期 |
+| 每天 17:00 | ① 新建当天流水线（情报 + 选题）在 cron 本体跑；② 发布到期视频、③ 回收 24h / 72h 数据、④ webhook 续期 各自拆成独立函数并行跑，互不阻塞 |
 | 每周一 17:00 | 周复盘，更新经验库 |
 
 17:00 UTC = 美东 12:00（冬令时）= 北京 / 吉隆坡次日 01:00。所有日期判断都按 UTC。
@@ -283,9 +283,11 @@ koubo-opc-sys/
 
 ## ⚠️ 已知限制
 
-- 只自动发布 Instagram 和 Facebook。TikTok / YouTube 的 Caption 会生成，需要手动发
-- Webhook 端点没有校验 Airtable 签名（端点收到通知后会自己回 Airtable 拉数据，不信任请求内容）
-- 同一条 record 的并发变更没有加锁，极端情况下可能重复触发一次生成
+- 只自动发布 Instagram 和 Facebook；TikTok / YouTube 的 Caption 会生成但需手动发
+- Webhook 端点不校验 Airtable 签名（端点收到通知后自己回 Airtable 拉数据，不信任请求内容）
+- Airtable 通知是 at-least-once：同一条 record 偶尔会被重复分发。四个阶段处理函数都有按「record + 内容 hash」的原子去重锁，成功后再提交同样内容会被跳过（见 CLAUDE.md §7「改了状态没反应」）
+- 预算护栏只统计 HeyGen；Claude / Tavily / TikHub 花费不计入
+- 所有日期判断按 UTC（cron 17:00 UTC = 北京/吉隆坡次日 01:00）
 
 ---
 

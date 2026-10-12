@@ -30,11 +30,15 @@ _FALLBACK_MODELS = {"claude-sonnet-5-5", "claude-opus-5-5"}
 
 
 def _strict(schema):
-    """结构化输出要求每个 object 都声明 additionalProperties: false,递归补上。"""
+    """结构化输出要求每个 object 都声明 additionalProperties: false,递归补上。
+    同时把 required 补成全部 properties:API 对可选字段的支持没有保证,
+    全部必填最稳,模型没内容时输出 "" / [] 即可。"""
     if isinstance(schema, dict):
         out = {k: _strict(v) for k, v in schema.items()}
         if out.get("type") == "object":
             out.setdefault("additionalProperties", False)
+            if isinstance(out.get("properties"), dict):
+                out["required"] = list(out["properties"])
         return out
     if isinstance(schema, list):
         return [_strict(v) for v in schema]

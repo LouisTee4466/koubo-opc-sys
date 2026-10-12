@@ -134,7 +134,7 @@
   2. 满意 →
      - （可选）填写 `Scheduled Publish Time 发布日期`（不填 = 下一次每日 Cron 发布；填了 = 到那天发布）
      - 将 `Heygen Status` 改为 `approved`
-  3. 不满意 → 修改 `Final Script`，再将 `Heygen Status` 改为 `ready` 重新生成（会再收一次 HeyGen 渲染费）
+  3. 不满意 → 修改 `Final Script`，再将 `Heygen Status` 改为 `ready` 重新生成（会再收一次 HeyGen 渲染费）（不改稿也会重新出片）
 
 #### 阶段 8：`待发布`
 - **触发**：`Heygen Status = approved` 后自动进入
@@ -264,6 +264,8 @@
 | Blotato | https://app.blotato.com → 右上角 Settings | `BLOTATO_API_KEY` |
 | Airtable | https://airtable.com/create/tokens | `AIRTABLE_PAT` |
 
+> Airtable PAT 需要 `data.records:read` / `data.records:write` / `schema.bases:read` / `webhook:manage` 四个 scope，并在 Access 里授权给复制出来的 Base。`webhook_register.py` 报 403 = PAT 缺 `webhook:manage`。
+
 **⚠️ 关于 Blotato Account ID 怎么找：**
 
 1. 登录 [Blotato 后台](https://app.blotato.com)
@@ -347,7 +349,7 @@ cp .env.template .env
 **问题 10：**「请提供你的 **Facebook Page ID**。获取方式：Blotato → Accounts → 点击 Facebook 账号详情 → 找 Page ID」
 → 写入 `BLOTATO_FB_PAGE_ID=<值>`
 
-**问题 11：**「请提供你的 **Airtable Personal Access Token**。获取地址：https://airtable.com/create/tokens → 创建 Token，勾选 data.records 和 schema.bases 权限」
+**问题 11：**「请提供你的 **Airtable Personal Access Token**。获取地址：https://airtable.com/create/tokens → 创建 Token，Scopes 勾选以下 4 项：`data.records:read`、`data.records:write`、`schema.bases:read`、`webhook:manage`；Access 部分要把第 3 步复制出来的 Base 加进去（没有 `webhook:manage` 的话第 8 步注册 Webhook 会报 403）」
 → 写入 `AIRTABLE_PAT=<值>`
 
 **问题 12（可选，强烈建议开启【成本护栏 + 出错告警】）：**
@@ -531,15 +533,32 @@ python webhook_register.py list
 
 ### ❓ HeyGen 视频一直 processing
 - HeyGen 有时服务器繁忙，系统会每 5 分钟轮询一次，最多等 2 小时
-- 超时后查看 Notes 备注，手动将 `Heygen Status` 改回 `ready` 重试
+- 超时后记录会进入「失败」。看 Notes 备注，把 `Current Stage 当前状态` 改回 `等待视频生成`（`Heygen Status` 保持 `ready`），系统会重新提交
 
 ### ❓ 发布失败
 - 检查 Blotato 账号是否还连接着 Instagram / Facebook
 - 检查 `BLOTATO_IG_ACCOUNT_ID` / `BLOTATO_FB_ACCOUNT_ID` / `BLOTATO_FB_PAGE_ID` 是否正确
 - 查看 Notes 备注字段里的错误信息
 
+### ❓ 状态变成「失败」后怎么重试
+先看 Notes 备注里的错误原因并修正（例如 API key、余额）再重试。唯一的重试方式是手动把 `Current Stage 当前状态` 改回失败前的阶段（对应的状态字段你之前已设好，会重新匹配）：
+
+| 失败环节 | 怎么重试 |
+|---|---|
+| 情报采集 / 选题生成失败 | 这条记录无法原地重跑（Run ID 已写入），新建一条记录 |
+| 文案生成失败 | 改回 `等待选题`（`Topic Status` 保持 `done`） |
+| 四平台文案生成失败 | 改回 `等待文案审核`（`Review Status` 保持 `approved`） |
+| HeyGen 提交 / 生成失败或超时 | 改回 `等待视频生成`（`Heygen Status` 保持 `ready`） |
+| 发布失败 | 改回 `待发布` |
+
+### ❓ 改了状态没反应
+- 系统按「记录 + 内容」去重：某阶段成功跑完后，如果再次选中**一模一样**的 `Final Topic` / `Final Script`，会被当成重复通知跳过。改动文字（哪怕一个字）再重新选中即可
+- 例外：在「等待视频审核」把 `Heygen Status` 改回 `ready`，脚本不变也会重新出片，这是有意设计的
+- 如果所有变更都没反应，看下面「Webhook 收不到通知」
+
 ### ❓ Webhook 收不到通知
 - 运行 `python webhook_register.py list` 检查 Webhook 是否注册
+- `webhook_register.py` 报 403 = Airtable PAT 缺 `webhook:manage` scope（或没授权给这个 Base），重新建 Token 后再跑 `setup`
 - 检查 Modal Secret 里的 `MODAL_WEBHOOK_URL` 是否是最新的部署 URL
 - Webhook 每 7 天到期，系统每天自动续期，如果续期失败重新运行 `python webhook_register.py setup`
 

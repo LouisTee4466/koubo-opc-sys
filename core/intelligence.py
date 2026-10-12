@@ -27,8 +27,8 @@ _TOP_PER_ACCOUNT = 5
 def _tavily_search(query: str) -> dict:
     resp = requests.post(
         "https://api.tavily.com/search",
+        headers={"Authorization": f"Bearer {TAVILY_API_KEY}"},
         json={
-            "api_key": TAVILY_API_KEY,
             "query": query,
             "search_depth": "basic",
             "max_results": 5,
@@ -42,6 +42,9 @@ def _tavily_search(query: str) -> dict:
 
 def fetch_tavily_intel(industry: str) -> list[dict]:
     """用行业关键词搜索三个维度的热点,返回合并结果列表。"""
+    if not TAVILY_API_KEY:
+        return [{"query": industry, "error": "TAVILY_API_KEY 未设置"}]
+
     queries = [
         f"{industry} trending content this week",
         f"{industry} viral videos",

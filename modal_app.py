@@ -15,6 +15,7 @@ Brand Clone Engine — Modal 主程序
   modal deploy modal_app.py
 """
 
+import hashlib
 import json
 import os
 import sys
@@ -47,6 +48,36 @@ BUDGET_DICT = modal.Dict.from_name("oral-video-director-budget", create_if_missi
 STATE_DICT = modal.Dict.from_name("oral-video-director-state", create_if_missing=True)
 # 单次通知最多翻页数（Airtable 每页 50 条）
 _MAX_PAYLOAD_PAGES = 40
+
+
+def _digest(text: str) -> str:
+    return hashlib.sha1((text or "").encode("utf-8")).hexdigest()[:12]
+
+
+def _claim(record_id: str, step: str) -> bool:
+    """一次性锁。Airtable 通知至少送达一次、webhook 容器又可能并发，
+    同一 record 的同一步骤会被 spawn 两次；put(skip_if_exists) 是原子的，只有第一次抢到。
+    step 里带内容 hash，改了选题/文案再触发就是新 key，合法重跑不受影响。"""
+    return STATE_DICT.put(
+        f"claim:{record_id}:{step}",
+        datetime.now(timezone.utc).isoformat(),
+        skip_if_exists=True,
+    )
+
+
+def _release(record_id: str, step: str) -> None:
+    """处理失败时放开锁，否则同样内容的人工重试会被当成重复触发。"""
+    STATE_DICT.pop(f"claim:{record_id}:{step}", None)
+
+
+def _release_quiet(record_id: str, step: str) -> None:
+    """终态释放锁；Dict 抖动不能挡住后面的 set_failed / 状态更新。"""
+    if not step:
+        return
+    try:
+        _release(record_id, step)
+    except Exception as e:
+        print(f"[claim] 释放 {record_id}:{step} 失败（已忽略）：{e}")
 
 
 def _notify(message: str, level: str = "info") -> None:
@@ -90,7 +121,7 @@ def _load():
 # Web Endpoint：接收 Airtable Webhook
 # ============================================================
 
-@app.function(image=image, secrets=[SECRET], timeout=60)
+@app.function(image=image, secrets=[SECRET], timeout=300)
 @modal.fastapi_endpoint(method="POST", label="oral-video-director-webhook")
 async def webhook_handler(request: Request):  # noqa: F811
     """
@@ -121,7 +152,9 @@ async def webhook_handler(request: Request):  # noqa: F811
                 for table_data in payload.get("changedTablesById", {}).values():
                     created.update(dict.fromkeys(table_data.get("createdRecordsById", {})))
                     changed.update(dict.fromkeys(table_data.get("changedRecordsById", {})))
-            cursor = data.get("cursor", cursor)
+            # 响应偶尔不带 cursor；存了 None 下次会从最旧的 payload 整个重放
+            if data.get("cursor") is not None:
+                cursor = data["cursor"]
             if not data.get("mightHaveMore"):
                 break
     except Exception as e:
@@ -137,7 +170,8 @@ async def webhook_handler(request: Request):  # noqa: F811
         print(f"[webhook] 记录变更 {record_id}，检查状态")
         dispatch_change.spawn(record_id=record_id)
 
-    STATE_DICT[cursor_key] = cursor
+    if cursor is not None:
+        STATE_DICT[cursor_key] = cursor
     return JSONResponse({"status": "ok"})
 
 
@@ -168,9 +202,10 @@ def dispatch_change(record_id: str):
         handle_heygen_ready.spawn(record_id=record_id)
 
     elif stage == "等待视频审核" and heygen_status == "ready":
-        # 视频不满意 → 用修改后的 Final Script 重新生成
-        at.set_stage(record_id, "等待视频生成")
-        handle_heygen_ready.spawn(record_id=record_id)
+        # 视频不满意 → 退回「等待视频生成」。这次写入会再触发一次 webhook，
+        # 由上面的分支提交 HeyGen；这里不直接 spawn，否则两条路径会各提交一次、收两次费。
+        # 上一次的锁在 poll_heygen 出片时已释放，文案没改也能重渲染
+        at.set_stage(record_id, "等待视频生成", notes="🔁 正在重新提交 HeyGen 生成视频…")
 
     elif stage == "等待视频审核" and heygen_status == "approved":
         # 视频审核通过 → 进入待发布队列，等 Cron 发布
@@ -181,7 +216,7 @@ def dispatch_change(record_id: str):
             ))
 
     else:
-        print(f"[dispatch] 无匹配动作，跳过")
+        print("[dispatch] 无匹配动作，跳过")
 
 
 # ============================================================
@@ -198,6 +233,11 @@ def handle_new_record(record_id: str):
     # 若已有 Run ID 说明是 Cron 建的，跳过
     if f.get("Run ID"):
         print(f"[new_record] {record_id} 已有 Run ID，跳过（由 Cron 处理）")
+        return
+
+    step = "new_record"
+    if not _claim(record_id, step):
+        print(f"[new_record] {record_id} 重复触发，已有一次在处理，跳过")
         return
 
     run_id = at.generate_run_id()
@@ -243,6 +283,7 @@ def handle_new_record(record_id: str):
         print(f"✅ {run_id} 情报采集 + 选题生成完成")
 
     except Exception as e:
+        _release(record_id, step)
         at.set_failed(record_id, f"情报采集/选题生成失败：{e}")
         raise
 
@@ -262,6 +303,11 @@ def handle_topic_done(record_id: str):
 
     if not final_topic:
         at.set_failed(record_id, "Final Topic 为空，请先填写选题标题再将 Topic Status 改为 done")
+        return
+
+    step = f"topic:{_digest(final_topic)}"
+    if not _claim(record_id, step):
+        print(f"[handle_topic_done] {record_id} 重复触发，同一 Final Topic 已在生成文案，跳过")
         return
 
     try:
@@ -298,6 +344,7 @@ def handle_topic_done(record_id: str):
             ),
         )
     except Exception as e:
+        _release(record_id, step)
         at.set_failed(record_id, f"文案生成失败：{e}")
         raise
 
@@ -317,6 +364,11 @@ def handle_script_approved(record_id: str):
 
     if not final_script:
         at.set_failed(record_id, "Final Script 为空，请先填写最终文案再将 Review Status 改为 approved")
+        return
+
+    step = f"script:{_digest(final_script)}"
+    if not _claim(record_id, step):
+        print(f"[handle_script_approved] {record_id} 重复触发，同一 Final Script 已在生成平台文案，跳过")
         return
 
     try:
@@ -339,6 +391,7 @@ def handle_script_approved(record_id: str):
             ),
         )
     except Exception as e:
+        _release(record_id, step)
         at.set_failed(record_id, f"四平台文案生成失败：{e}")
         raise
 
@@ -377,14 +430,21 @@ def handle_heygen_ready(record_id: str):
         ))
         return
 
+    # stage 守卫挡不住两个容器同时读到「等待视频生成」的窗口，再加原子锁
+    step = f"heygen:{_digest(final_script)}"
+    if not _claim(record_id, step):
+        print(f"[handle_heygen_ready] {record_id} 重复触发，同一 Final Script 已提交 HeyGen，跳过")
+        return
+
     try:
         at.set_stage(record_id, "视频生成中")
         video_id = vgen_mod.submit_video(final_script, avatar_id, voice_id)
         at.update_pipeline(record_id, {
             "Notes 备注": f"🎬 HeyGen 任务已提交（video_id={video_id}），正在生成中，请耐心等待 1-3 分钟..."
         })
-        poll_heygen.spawn(record_id=record_id, video_id=video_id, attempt=1)
+        poll_heygen.spawn(record_id=record_id, video_id=video_id, attempt=1, step=step)
     except Exception as e:
+        _release(record_id, step)
         at.set_failed(record_id, f"HeyGen 任务提交失败：{e}")
         raise
 
@@ -394,11 +454,13 @@ def handle_heygen_ready(record_id: str):
 # ============================================================
 
 @app.function(image=image, secrets=[SECRET], timeout=360)
-def poll_heygen(record_id: str, video_id: str, attempt: int):
+def poll_heygen(record_id: str, video_id: str, attempt: int, step: str = ""):
     import time
     at, _, _, _, _, vgen_mod, _ = _load()
 
+    # step 是提交时抢到的锁 key；三个终态都释放，用户改回「等待视频生成」即可用同一文案重试
     if attempt > 24:
+        _release_quiet(record_id, step)
         at.set_failed(record_id, "HeyGen 视频生成超时（超过2小时），请检查 HeyGen 后台或重新提交")
         return
 
@@ -433,14 +495,17 @@ def poll_heygen(record_id: str, video_id: str, attempt: int):
                 "👉 下一步：\n"
                 "1. 点击 Video File 字段预览视频\n"
                 "2. 满意 → 将 Heygen Status 改为 approved（Scheduled Publish Time 留空 = 下一次每日定时任务发布，填了日期 = 到那天发布）\n"
-                "3. 不满意 → 修改 Final Script，再将 Heygen Status 改为 ready 重新生成"
+                "3. 不满意 → 将 Heygen Status 改回 ready 重新生成（可先修改 Final Script）"
             ),
         )
+        # 先写完「等待视频审核」再放锁：此时任何迟到的「等待视频生成+ready」处理函数都会被 stage 守卫挡住
+        _release_quiet(record_id, step)
     elif status == "failed":
+        _release_quiet(record_id, step)
         at.set_failed(record_id, f"HeyGen 生成失败：{result.get('error', {})}")
     else:
         time.sleep(300)
-        poll_heygen.spawn(record_id=record_id, video_id=video_id, attempt=attempt + 1)
+        poll_heygen.spawn(record_id=record_id, video_id=video_id, attempt=attempt + 1, step=step)
 
 
 
@@ -483,9 +548,103 @@ def _refresh_webhook():
             print(f"✅ Webhook 有效，剩余 {remaining} 天，无需续期")
 
 
+@app.function(image=image, secrets=[SECRET], timeout=60)
+def refresh_webhook():
+    _refresh_webhook()
+
+
+# ============================================================
+# 每日任务 ②：定时发布（待发布 且 发布日期留空或已到）
+# ============================================================
+
+@app.function(image=image, secrets=[SECRET], timeout=600)
+def publish_pending():
+    at, _, _, _, _, _, publisher_mod = _load()
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    to_publish = at.list_pending_publish()
+    print(f"📅 今日待发布：{len(to_publish)} 条")
+    for rec in to_publish:
+        r_id = rec["id"]
+        f = rec["fields"]
+        r_run_id = f.get("Run ID", r_id)
+        try:
+            at.set_stage(r_id, "发布中")
+            attachments = f.get("Video File 视频", [])
+            video_url = attachments[0].get("url", "") if attachments else ""
+            result = publisher_mod.publish_all_platforms(
+                video_url=video_url,
+                instagram_caption=f.get("Instagram Caption", ""),
+                facebook_caption=f.get("Facebook Caption", ""),
+            )
+            at.update_pipeline(r_id, {
+                "Publish Links 发布链接": json.dumps(result, ensure_ascii=False),
+                "Published At 发布时间": today,
+            })
+            at.set_stage(r_id, "已完成", notes="✅ 已发布到 Instagram 和 Facebook。")
+            print(f"✅ [{r_run_id}] 发布完成")
+        except Exception as e:
+            at.set_failed(r_id, f"发布失败：{e}")
+            print(f"❌ [{r_run_id}] 发布失败：{e}")
+
+
+# ============================================================
+# 每日任务 ③：数据回收（昨天发布的 24h 数据 + 3天前发布的 72h 数据）
+# ============================================================
+
+@app.function(image=image, secrets=[SECRET], timeout=600)
+def collect_stats():
+    at, _, _, _, _, _, publisher_mod = _load()
+    for days_ago, label in [(1, "24h"), (3, "72h")]:
+        records = at.list_for_stats(days_ago)
+        print(f"📊 {label} 数据回收：{len(records)} 条")
+        for rec in records:
+            f = rec["fields"]
+            r_run_id = f.get("Run ID", rec["id"])
+            links_raw = f.get("Publish Links 发布链接", "")
+            if not links_raw:
+                continue
+            try:
+                publish_links = json.loads(links_raw)
+            except Exception:
+                continue
+            links_updated = False
+            for platform, info in publish_links.items():
+                if not info.get("success"):
+                    continue
+                sub_id = info.get("post_id", "")
+                if not sub_id:
+                    continue
+                # 单条/单平台出错只记一行日志，不拖垮当天其余数据回收
+                try:
+                    stats = publisher_mod.fetch_platform_stats(platform, sub_id)
+                    at.create_stat_record(
+                        run_id=r_run_id,
+                        platform=platform,
+                        platform_video_id=sub_id,
+                        play=stats["play"],
+                        like=stats["like"],
+                        comment=stats["comment"],
+                        share=stats["share"],
+                    )
+                    print(f"✅ [{r_run_id}] {platform} {label} 数据写入")
+                except Exception as e:
+                    print(f"❌ [{r_run_id}] {platform} {label} 数据回收失败：{e}")
+                    continue
+                # 回填 post_url（发布时 Blotato 异步还没有，现在补上）
+                if not info.get("post_url") and stats.get("post_url"):
+                    publish_links[platform]["post_url"] = stats["post_url"]
+                    links_updated = True
+            if links_updated:
+                at.update_pipeline(rec["id"], {
+                    "Publish Links 发布链接": json.dumps(publish_links, ensure_ascii=False)
+                })
+                print(f"🔗 [{r_run_id}] post_url 已回填")
+
+
 # ============================================================
 # Cron：每天 17:00 UTC（EST 12:00 / 北京时间次日 01:00）
-# 三件事：① 情报采集 + 选题生成  ② 定时发布  ③ 数据回收
+# ① 情报采集 + 选题生成 在本函数内跑；② 定时发布 ③ 数据回收 ④ Webhook 续期
+# 各自 spawn 成独立函数，Blotato 上传慢或重试不会拖死其他任务
 # ============================================================
 
 @app.function(image=image, secrets=[SECRET], schedule=modal.Cron("0 17 * * *"), timeout=600)
@@ -493,6 +652,11 @@ def daily_pipeline():
     at, intel_mod, topic_mod, *_ = _load()
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     print(f"[{today}] 每日流水线启动（EST 12:00）")
+
+    # 先派发，① 里 Brand Config / 生成定位摘要若抛错也不影响发布和回收
+    publish_pending.spawn()
+    collect_stats.spawn()
+    refresh_webhook.spawn()
 
     # ── ① 情报采集 + 选题生成 ──────────────────────────────
     brand = at.get_brand_config()
@@ -518,7 +682,7 @@ def daily_pipeline():
         )
         at.update_brand_config(brand["id"], {"AI Profile Summary 账号定位": profile_summary})
         bf["AI Profile Summary 账号定位"] = profile_summary
-        print(f"✅ AI Profile Summary 已生成并写入 Brand Config")
+        print("✅ AI Profile Summary 已生成并写入 Brand Config")
 
     run_id = at.generate_run_id()
     rec_id = at.create_pipeline_run(run_id)["id"]
@@ -555,78 +719,6 @@ def daily_pipeline():
     except Exception as e:
         at.set_failed(rec_id, f"情报采集失败：{e}")
         print(f"❌ 情报采集失败：{e}")
-
-    # ── ② 定时发布（待发布 且 发布日期留空或已到）──
-    _, _, _, _, _, _, publisher_mod = _load()
-    to_publish = at.list_pending_publish()
-    print(f"📅 今日待发布：{len(to_publish)} 条")
-    for rec in to_publish:
-        r_id = rec["id"]
-        f = rec["fields"]
-        r_run_id = f.get("Run ID", r_id)
-        try:
-            at.set_stage(r_id, "发布中")
-            attachments = f.get("Video File 视频", [])
-            video_url = attachments[0].get("url", "") if attachments else ""
-            result = publisher_mod.publish_all_platforms(
-                video_url=video_url,
-                instagram_caption=f.get("Instagram Caption", ""),
-                facebook_caption=f.get("Facebook Caption", ""),
-            )
-            at.update_pipeline(r_id, {
-                "Publish Links 发布链接": json.dumps(result, ensure_ascii=False),
-                "Published At 发布时间": today,
-            })
-            at.set_stage(r_id, "已完成", notes="✅ 已发布到 Instagram 和 Facebook。")
-            print(f"✅ [{r_run_id}] 发布完成")
-        except Exception as e:
-            at.set_failed(r_id, f"发布失败：{e}")
-            print(f"❌ [{r_run_id}] 发布失败：{e}")
-
-    # ── ③ 数据回收（昨天发布的 24h 数据 + 3天前发布的 72h 数据）──
-    for days_ago, label in [(1, "24h"), (3, "72h")]:
-        records = at.list_for_stats(days_ago)
-        print(f"📊 {label} 数据回收：{len(records)} 条")
-        for rec in records:
-            f = rec["fields"]
-            r_run_id = f.get("Run ID", rec["id"])
-            links_raw = f.get("Publish Links 发布链接", "")
-            if not links_raw:
-                continue
-            try:
-                publish_links = json.loads(links_raw)
-            except Exception:
-                continue
-            links_updated = False
-            for platform, info in publish_links.items():
-                if not info.get("success"):
-                    continue
-                sub_id = info.get("post_id", "")
-                if not sub_id:
-                    continue
-                stats = publisher_mod.fetch_platform_stats(platform, sub_id)
-                at.create_stat_record(
-                    run_id=r_run_id,
-                    platform=platform,
-                    platform_video_id=sub_id,
-                    play=stats["play"],
-                    like=stats["like"],
-                    comment=stats["comment"],
-                    share=stats["share"],
-                )
-                print(f"✅ [{r_run_id}] {platform} {label} 数据写入")
-                # 回填 post_url（发布时 Blotato 异步还没有，现在补上）
-                if not info.get("post_url") and stats.get("post_url"):
-                    publish_links[platform]["post_url"] = stats["post_url"]
-                    links_updated = True
-            if links_updated:
-                at.update_pipeline(rec["id"], {
-                    "Publish Links 发布链接": json.dumps(publish_links, ensure_ascii=False)
-                })
-                print(f"🔗 [{r_run_id}] post_url 已回填")
-
-    # ── ④ Webhook 续期检查 ────────────────────────────────────
-    _refresh_webhook()
 
 
 # ============================================================

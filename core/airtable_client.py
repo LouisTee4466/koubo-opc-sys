@@ -150,7 +150,7 @@ def list_for_stats(days_ago: int) -> list[dict]:
 
 def list_stats_for_review(days: int = 30) -> list[dict]:
     """列出过去 N 天内已发布的记录，用于周复盘"""
-    formula = f"AND({{Publish Links 发布链接}}!='', {{Current Stage 当前状态}}='已完成')"
+    formula = "AND({Publish Links 发布链接}!='', {Current Stage 当前状态}='已完成')"
     return _list(TBL_PIPE, filter_formula=formula, max_records=200)
 
 
