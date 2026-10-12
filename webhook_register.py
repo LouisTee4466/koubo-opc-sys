@@ -65,6 +65,9 @@ def list_webhooks() -> list[dict]:
 
 
 def register_webhook(notification_url: str) -> dict:
+    # Airtable 要求 URL 是规范形式（根路径带斜杠），否则 422 INVALID_WEBHOOK_NOTIFICATION_URL
+    if notification_url.count("/") == 2:
+        notification_url += "/"
     payload = {
         "notificationUrl": notification_url,
         "specification": {
