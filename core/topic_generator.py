@@ -63,7 +63,7 @@ def generate_topics(
 
 先在心里提炼这些竞品「为什么爆」,再生成 10 条最有可能爆量的口播视频选题。"""
 
-    result = llm.structured(SYSTEM, user_msg, TOPICS_SCHEMA, model=llm.MODEL_CHEAP, max_tokens=3000)
+    result = llm.structured(SYSTEM, user_msg, TOPICS_SCHEMA, model=llm.MODEL_CHEAP)
     return result.get("topics", [])
 
 

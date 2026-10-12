@@ -43,12 +43,12 @@ def _write_env(key: str, value: str):
         f.write(content)
 
 
-def _update_modal_secret(webhook_id: str, webhook_secret: str):
-    """把新 Webhook ID / Secret 同步写入 Modal Secret。"""
+def _sync_modal_secret():
+    """把完整 .env 同步到 Modal Secret。
+    `modal secret create --force` 是整份覆盖，只传个别 key 会把其余 key 全部清掉，所以必须整份同步。"""
     cmd = [
         "modal", "secret", "create", "oral-video-director-secrets",
-        f"AIRTABLE_WEBHOOK_ID={webhook_id}",
-        f"AIRTABLE_WEBHOOK_SECRET={webhook_secret}",
+        "--from-dotenv", ENV_FILE,
         "--force",
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -110,7 +110,7 @@ def setup():
 
     _write_env("AIRTABLE_WEBHOOK_ID", webhook_id)
     _write_env("AIRTABLE_WEBHOOK_SECRET", webhook_secret)
-    _update_modal_secret(webhook_id, webhook_secret)
+    _sync_modal_secret()
 
     print(f"✅ Webhook 注册成功")
     print(f"   ID：{webhook_id}")

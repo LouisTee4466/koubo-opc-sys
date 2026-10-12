@@ -30,7 +30,7 @@ app = modal.App("oral-video-director")
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
-        "anthropic>=0.40.0",
+        "anthropic>=1.13.0",
         "requests>=2.32.0",
         "python-dotenv>=1.0.0",
         "fastapi[standard]>=0.115.0",
@@ -42,6 +42,11 @@ SECRET = modal.Secret.from_name("oral-video-director-secrets")
 
 # 成本累计（按月持久化，跨调用共享）
 BUDGET_DICT = modal.Dict.from_name("oral-video-director-budget", create_if_missing=True)
+
+# Webhook 游标：记住已处理到哪条 payload，下次从这里接着拉
+STATE_DICT = modal.Dict.from_name("oral-video-director-state", create_if_missing=True)
+# 单次通知最多翻页数（Airtable 每页 50 条）
+_MAX_PAYLOAD_PAGES = 40
 
 
 def _notify(message: str, level: str = "info") -> None:
@@ -85,12 +90,12 @@ def _load():
 # Web Endpoint：接收 Airtable Webhook
 # ============================================================
 
-@app.function(image=image, secrets=[SECRET], timeout=30)
+@app.function(image=image, secrets=[SECRET], timeout=60)
 @modal.fastapi_endpoint(method="POST", label="oral-video-director-webhook")
 async def webhook_handler(request: Request):  # noqa: F811
     """
-    Airtable 发来的 Webhook 通知（body 只含 webhookId + cursor）。
-    拉取实际 payload 后，根据 record 状态分发到对应处理函数。
+    Airtable 发来的 Webhook 通知（body 只含 webhook id，不含变更内容）。
+    从上次保存的游标接着拉 payload，根据 record 状态分发到对应处理函数。
     立即返回 200，实际处理异步执行。
     """
     body = await request.json()
@@ -98,37 +103,41 @@ async def webhook_handler(request: Request):  # noqa: F811
 
     # Airtable body 格式: {"webhook": {"id": "..."}, "base": {...}, "timestamp": "..."}
     webhook_id = (body.get("webhook") or {}).get("id") or os.getenv("AIRTABLE_WEBHOOK_ID", "").strip("'")
-    cursor = body.get("cursor")
 
     if not webhook_id:
         return JSONResponse({"status": "ok", "note": "no webhookId"})
 
     at, *_ = _load()
+
+    # Airtable 不记游标：不带 cursor 每次都从最旧的 payload 开始、单次最多 50 条。
+    # 所以游标必须自己存，并翻页拉到最新，否则积压超过 50 条后就再也看不到新变更。
+    cursor_key = f"webhook_cursor:{webhook_id}"
+    cursor = STATE_DICT.get(cursor_key)
+    created, changed = {}, {}
     try:
-        data = at.fetch_webhook_payloads(webhook_id, cursor)
+        for _ in range(_MAX_PAYLOAD_PAGES):
+            data = at.fetch_webhook_payloads(webhook_id, cursor)
+            for payload in data.get("payloads", []):
+                for table_data in payload.get("changedTablesById", {}).values():
+                    created.update(dict.fromkeys(table_data.get("createdRecordsById", {})))
+                    changed.update(dict.fromkeys(table_data.get("changedRecordsById", {})))
+            cursor = data.get("cursor", cursor)
+            if not data.get("mightHaveMore"):
+                break
     except Exception as e:
+        # 游标不前移，下次通知会从同一位置重拉
         print(f"[webhook] 拉取 payload 失败：{e}")
         return JSONResponse({"status": "ok"})
 
-    # 只处理最新一条 payload，避免历史堆积重复触发
-    payloads = data.get("payloads", [])
-    if not payloads:
-        return JSONResponse({"status": "ok"})
+    for record_id in created:
+        print(f"[webhook] 新建记录 {record_id}")
+        handle_new_record.spawn(record_id=record_id)
+    # 分发器只看 record 当前状态，同一条 record 多次变更只需分发一次
+    for record_id in changed:
+        print(f"[webhook] 记录变更 {record_id}，检查状态")
+        dispatch_change.spawn(record_id=record_id)
 
-    latest = payloads[-1]
-    seen_records = set()
-    for table_id, table_data in latest.get("changedTablesById", {}).items():
-        for record_id in table_data.get("createdRecordsById", {}):
-            if record_id not in seen_records:
-                seen_records.add(record_id)
-                print(f"[webhook] 新建记录 {record_id}")
-                handle_new_record.spawn(record_id=record_id)
-        for record_id in table_data.get("changedRecordsById", {}):
-            if record_id not in seen_records:
-                seen_records.add(record_id)
-                print(f"[webhook] 记录变更 {record_id}，检查状态")
-                dispatch_change.spawn(record_id=record_id)
-
+    STATE_DICT[cursor_key] = cursor
     return JSONResponse({"status": "ok"})
 
 
@@ -158,10 +167,18 @@ def dispatch_change(record_id: str):
     elif stage == "等待视频生成" and heygen_status == "ready":
         handle_heygen_ready.spawn(record_id=record_id)
 
+    elif stage == "等待视频审核" and heygen_status == "ready":
+        # 视频不满意 → 用修改后的 Final Script 重新生成
+        at.set_stage(record_id, "等待视频生成")
+        handle_heygen_ready.spawn(record_id=record_id)
+
     elif stage == "等待视频审核" and heygen_status == "approved":
         # 视频审核通过 → 进入待发布队列，等 Cron 发布
         at.set_stage(record_id, "待发布",
-            notes="✅ 视频已审核通过，等待 Cron 按发布日期发布。\n\n请确认 Scheduled Publish Time 已填写正确。")
+            notes=(
+                "✅ 视频已审核通过，等待每日定时任务（17:00 UTC）发布。\n\n"
+                "Scheduled Publish Time 留空 = 下一次定时任务发布；填了日期 = 到那天发布。"
+            ))
 
     else:
         print(f"[dispatch] 无匹配动作，跳过")
@@ -234,7 +251,7 @@ def handle_new_record(record_id: str):
 # Topic Status → done → 生成文案
 # ============================================================
 
-@app.function(image=image, secrets=[SECRET], timeout=180)
+@app.function(image=image, secrets=[SECRET], timeout=600)
 def handle_topic_done(record_id: str):
     at, _, _, copy_mod, *_ = _load()
 
@@ -415,7 +432,7 @@ def poll_heygen(record_id: str, video_id: str, attempt: int):
                 "✅ 视频已生成，已上传到 Video File 字段。\n\n"
                 "👉 下一步：\n"
                 "1. 点击 Video File 字段预览视频\n"
-                "2. 满意 → 填写 Scheduled Publish Time（留空则立即发布），再将 Review Status 改为 approved\n"
+                "2. 满意 → 将 Heygen Status 改为 approved（Scheduled Publish Time 留空 = 下一次每日定时任务发布，填了日期 = 到那天发布）\n"
                 "3. 不满意 → 修改 Final Script，再将 Heygen Status 改为 ready 重新生成"
             ),
         )
@@ -467,7 +484,7 @@ def _refresh_webhook():
 
 
 # ============================================================
-# Cron：每天北京时间 06:00（UTC 22:00）
+# Cron：每天 17:00 UTC（EST 12:00 / 北京时间次日 01:00）
 # 三件事：① 情报采集 + 选题生成  ② 定时发布  ③ 数据回收
 # ============================================================
 
@@ -498,7 +515,6 @@ def daily_pipeline():
 
 直接输出描述文本，不要标题和前缀。""",
             model=llm.MODEL_CHEAP,
-            max_tokens=800,
         )
         at.update_brand_config(brand["id"], {"AI Profile Summary 账号定位": profile_summary})
         bf["AI Profile Summary 账号定位"] = profile_summary
@@ -540,7 +556,7 @@ def daily_pipeline():
         at.set_failed(rec_id, f"情报采集失败：{e}")
         print(f"❌ 情报采集失败：{e}")
 
-    # ── ② 定时发布（Scheduled Publish Time = 今天 且 Heygen Status = approved）──
+    # ── ② 定时发布（待发布 且 发布日期留空或已到）──
     _, _, _, _, _, _, publisher_mod = _load()
     to_publish = at.list_pending_publish()
     print(f"📅 今日待发布：{len(to_publish)} 条")
@@ -666,7 +682,6 @@ def weekly_review():
 【人工改稿偏好】用户倾向怎么改AI的稿子，下次起草直接照做...
 【需要避免】...""",
         model=llm.MODEL_QUALITY,
-        max_tokens=1500,
     )
 
     conclusion = f"\n\n[{datetime.now(timezone.utc).strftime('%Y-%m-%d')} 周复盘]\n{review_text}"

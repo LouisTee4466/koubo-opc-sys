@@ -63,7 +63,7 @@ def adapt_for_platforms(final_script: str, topic: str) -> dict:
 
 请为四个平台各改写一版标题与文案。"""
 
-    data = llm.structured(SYSTEM, user_msg, CAPTIONS_SCHEMA, model=llm.MODEL_CHEAP, max_tokens=2000)
+    data = llm.structured(SYSTEM, user_msg, CAPTIONS_SCHEMA, model=llm.MODEL_CHEAP)
 
     tk = data.get("tiktok", {})
     ig = data.get("instagram", {})

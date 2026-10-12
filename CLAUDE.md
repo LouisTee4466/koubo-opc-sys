@@ -132,14 +132,14 @@
 - **👤 用户需要做什么**：
   1. 点击 `Video File 视频` 预览视频
   2. 满意 →
-     - （可选）填写 `Scheduled Publish Time 发布日期`（不填则当天 Cron 发布）
+     - （可选）填写 `Scheduled Publish Time 发布日期`（不填 = 下一次每日 Cron 发布；填了 = 到那天发布）
      - 将 `Heygen Status` 改为 `approved`
-  3. 不满意 → 修改 `Final Script`，再将 `Heygen Status` 改为 `ready` 重新生成
+  3. 不满意 → 修改 `Final Script`，再将 `Heygen Status` 改为 `ready` 重新生成（会再收一次 HeyGen 渲染费）
 
 #### 阶段 8：`待发布`
 - **触发**：`Heygen Status = approved` 后自动进入
-- **等待**：Cron 每天 EST 12:00 检查 `Scheduled Publish Time = 今天` 的记录
-- **提醒**：确保 `Scheduled Publish Time` 已填写正确的日期
+- **等待**：Cron 每天 EST 12:00（UTC 17:00）发布「发布日期留空，或发布日期已到」的记录
+- **提醒**：日期按 UTC 计算；想延后发布就填未来日期，留空则下一次 Cron 就发
 
 #### 阶段 9：`发布中`
 - **触发**：Cron 检测到待发布记录
@@ -214,7 +214,7 @@
 | Facebook Caption | Long text | Facebook 专用文案 |
 | YouTube Description | Long text | YouTube 专用文案 |
 | Video File 视频 | Attachment | HeyGen 生成的视频文件 |
-| Scheduled Publish Time 发布日期 | Date | 计划发布日期（不填则当天 Cron 发布） |
+| Scheduled Publish Time 发布日期 | Date | 计划发布日期（不填 = 下一次每日 Cron 发布） |
 | Published At 发布时间 | Date | 实际发布日期（系统自动填写） |
 | Publish Links 发布链接 | Long text | 各平台发布结果（JSON） |
 | Notes 备注 | Long text | 系统操作日志和用户提示 |
@@ -421,32 +421,14 @@ modal setup
 
 ### 🔐 第 6 步：创建 Modal Secret
 
-把所有环境变量上传到 Modal Secret：
+把 `.env` 里的全部环境变量上传到 Modal Secret：
 
 ```bash
-modal secret create oral-video-director-secrets \
-  ANTHROPIC_API_KEY="your_key" \
-  TAVILY_API_KEY="your_key" \
-  TIKHUB_API_KEY="your_key" \
-  HEYGEN_API_KEY="your_key" \
-  HEYGEN_AVATAR_ID="your_avatar_id" \
-  HEYGEN_VOICE_ID="your_voice_id" \
-  BLOTATO_API_KEY="your_key" \
-  BLOTATO_IG_ACCOUNT_ID="your_id" \
-  BLOTATO_FB_ACCOUNT_ID="your_id" \
-  BLOTATO_FB_PAGE_ID="your_page_id" \
-  AIRTABLE_PAT="your_pat" \
-  AIRTABLE_BASE_ID="appXXXXXXXXXXXXXX" \
-  AIRTABLE_BRAND_CONFIG_TABLE="tblXXXXXXXXXXXXXX" \
-  AIRTABLE_PIPELINE_TABLE="tblXXXXXXXXXXXXXX" \
-  AIRTABLE_STATS_TABLE="tblXXXXXXXXXXXXXX" \
-  MONTHLY_BUDGET_USD="200" \
-  HEYGEN_COST_PER_SEC="0.05" \
-  ALERT_WEBHOOK_URL=""
+modal secret create oral-video-director-secrets --from-dotenv .env --force
 ```
 
-> 💡 把上面的 `your_key` 等占位符替换成你在第 2 步收集的真实值。
-> 最后三项是成本护栏与告警：`MONTHLY_BUDGET_USD` 每月预算上限（美元，超过自动暂停出视频），`HEYGEN_COST_PER_SEC` 按数字人引擎填的每秒单价，`ALERT_WEBHOOK_URL` 填 Slack/Discord Webhook 可接收告警（留空则关闭推送，仅记录日志）。
+> ⚠️ `--force` 是**整份覆盖**：Secret 里只会剩下这次传进去的变量。所以永远用 `--from-dotenv .env` 同步完整的 `.env`，不要只传单个 key。
+> 💡 之后改了 `.env` 里任何一项（换 API Key、调预算），重新跑一次上面这条命令即可。
 
 ---
 
@@ -461,16 +443,10 @@ modal deploy modal_app.py
 https://xxxxxxxxxx--oral-video-director-webhook-handler.modal.run
 ```
 
-**把这个 URL 填入 .env 和 Modal Secret：**
+**把这个 URL 写入 `.env` 的 `MODAL_WEBHOOK_URL=`，再把完整 `.env` 重新同步到 Modal Secret：**
 
 ```bash
-# 更新 .env
-# MODAL_WEBHOOK_URL=https://你的url
-
-# 更新 Modal Secret
-modal secret create oral-video-director-secrets \
-  MODAL_WEBHOOK_URL="https://你的url" \
-  --force
+modal secret create oral-video-director-secrets --from-dotenv .env --force
 ```
 
 ---
@@ -483,7 +459,7 @@ python webhook_register.py setup
 
 这个命令会：
 1. 在 Airtable 注册一个 Webhook，监听 Content Pipeline 表的变化
-2. 把 Webhook ID 和 Secret 写入 Modal Secret
+2. 把 Webhook ID 和 Secret 写入 `.env`，并把完整 `.env` 同步到 Modal Secret
 3. 输出注册成功信息和 Webhook 到期时间（7 天，系统会自动续期）
 
 ---
@@ -574,12 +550,11 @@ modal deploy modal_app.py
 注意：重新部署后 Webhook URL 不会变，无需重新注册 Webhook。
 
 ### ❓ 更新 API Key
+先改 `.env` 里对应的值，再整份同步（不要只传单个 key，`--force` 会把其余 key 清掉）：
 ```bash
-modal secret create oral-video-director-secrets \
-  新KEY名="新KEY值" \
-  --force
+modal secret create oral-video-director-secrets --from-dotenv .env --force
 ```
 
 ---
 
-*文档最后更新：2026-06-14*
+*文档最后更新：2026-10-13*

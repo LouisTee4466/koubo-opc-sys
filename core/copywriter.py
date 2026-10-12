@@ -5,7 +5,7 @@
   1. 好模型起草(hooks / body / ctas)
   2. 便宜模型挑刺(钩子够不够狠、有没有 AI 腔、是否具体)
   3. 好模型据此修订
-全部用结构化输出(强制 tool use),不再手撕 JSON。
+全部用结构化输出(JSON Schema),不再手撕 JSON。
 """
 
 import json
@@ -110,7 +110,7 @@ def generate_script(
     critique = llm.structured(
         CRITIQUE_SYSTEM,
         base_ctx + f"\n\n## 待审文案\n{json.dumps(draft, ensure_ascii=False)}\n\n请挑出问题并给出修改方向。",
-        CRITIQUE_SCHEMA, model=llm.MODEL_CHEAP, max_tokens=1200,
+        CRITIQUE_SCHEMA, model=llm.MODEL_CHEAP,
     )
 
     # 3) 修订(好模型)
@@ -134,4 +134,4 @@ def review_script(hooks: list, body: str, ctas: list) -> dict:
         *[f"【CTA-{c.get('type','')}】{c.get('text','')}" for c in ctas],
     ])
     user_msg = f"请审核以下口播文案,没问题时 issues 返回空数组、approved 为 true:\n\n---\n{full_text}\n---"
-    return llm.structured(REVIEW_SYSTEM, user_msg, REVIEW_SCHEMA, model=llm.MODEL_CHEAP, max_tokens=1200)
+    return llm.structured(REVIEW_SYSTEM, user_msg, REVIEW_SCHEMA, model=llm.MODEL_CHEAP)

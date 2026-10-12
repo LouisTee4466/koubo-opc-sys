@@ -127,12 +127,13 @@ def set_failed(record_id: str, error_msg: str) -> None:
 
 
 def list_pending_publish() -> list[dict]:
-    """列出 Scheduled Publish Time = 今天 且 Heygen Status = approved 且尚未发布的记录"""
+    """列出「待发布」且尚未发布、发布日期留空或已到（今天及更早）的记录"""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    scheduled = "{Scheduled Publish Time 发布日期}"
     formula = (
         f"AND("
         f"{{Current Stage 当前状态}}='待发布', "
-        f"IS_SAME({{Scheduled Publish Time 发布日期}}, '{today}', 'day'), "
+        f"OR({scheduled}=BLANK(), IS_SAME({scheduled}, '{today}', 'day'), IS_BEFORE({scheduled}, '{today}')), "
         f"{{Publish Links 发布链接}}=''"
         f")"
     )
@@ -212,8 +213,9 @@ def generate_run_id() -> str:
 # Webhook Payload 拉取
 # ============================================================
 
+@retry()
 def fetch_webhook_payloads(webhook_id: str, cursor: int = None) -> dict:
-    """从 Airtable 拉取 Webhook 实际变更数据（通知 body 只含 cursor，数据要单独拉）"""
+    """从 Airtable 拉取 cursor 之后的 Webhook 变更数据；返回里的 cursor 是下次的起点"""
     url = f"https://api.airtable.com/v0/bases/{BASE_ID}/webhooks/{webhook_id}/payloads"
     params = {}
     if cursor is not None:
