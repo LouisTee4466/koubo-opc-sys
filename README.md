@@ -219,8 +219,10 @@ koubo-opc-sys/
 │   └── notifier.py         # Slack / Discord 告警
 ├── .env.template           # 环境变量模板
 ├── .mcp.json               # Airtable MCP 配置
-├── CLAUDE.md               # 完整安装 + 使用文档
-├── 快速开始.md              # 上手指南 + 改动记录
+├── tests/                  # 离线测试（不打真实 API）
+├── CLAUDE.md               # 完整安装 + 使用 + 排错文档
+├── 快速开始.md              # 团队上手：角色、账号 / API 清单、安装、验证
+├── CHANGELOG.md            # 改动记录
 └── AI口播编导系统构建 SOP.docx
 ```
 
@@ -295,6 +297,7 @@ koubo-opc-sys/
 
 | 文档 | 内容 |
 |---|---|
-| [`快速开始.md`](快速开始.md) | 上手步骤、成本、改动记录 |
-| [`CLAUDE.md`](CLAUDE.md) | 状态机详解、Airtable 表结构、逐步安装、排错 |
+| [`快速开始.md`](快速开始.md) | 团队上手：运营者 / 部署者角色、需要的账号与 API 清单、安装、上线验证 |
+| [`CLAUDE.md`](CLAUDE.md) | 状态机详解、Airtable 表结构、逐步安装、失败重试与排错 |
+| [`CHANGELOG.md`](CHANGELOG.md) | 改动记录 |
 | `AI口播编导系统构建 SOP.docx` | 图文版构建 SOP |
